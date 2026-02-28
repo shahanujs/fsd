@@ -1,3 +1,14 @@
+"""
+Author: anuj
+Company: anuj corporation
+Date: YYYY-MM-DD
+Time: HH:MM:SS
+Purpose:
+    Control a Raspberry Pi based robot using keyboard teleoperation,
+    steering servo control, motor speed/direction control, and optional
+    camera recording with action logging for driving sessions.
+"""
+
 import cv2
 import time
 import RPi.GPIO as GPIO
