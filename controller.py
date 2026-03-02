@@ -11,6 +11,7 @@ import subprocess
 import signal
 import sys
 import time
+import atexit
 
 class RobotCockpit:
     def __init__(self, robot_ip="192.168.0.168", robot_port=5005, web_port=8000, ssh_host="rpi"):
@@ -59,19 +60,28 @@ class RobotCockpit:
         self.slider_rect = None  # set during draw
         self.dragging_steer_slider = False
         self.steer_slider_rect = None
-        self.steer_limit_deg = 80  # max steering angle in degrees (0-80)
+        self.steer_limit_deg = 32  # max steering angle in degrees (0-80), default ~40%
         self.dragging_dist_slider = False
         self.dist_slider_rect = None
         self.obstacle_dist_cm = 30  # stop if obstacle within this distance (cm)
         self.obstacle_blocked = False  # True when auto-stop is active
-        self.obstacle_avoidance_on = True  # Toggle for obstacle avoidance
+        self.obstacle_avoidance_on = False  # Toggle for obstacle avoidance
         self.oa_button_rect = None  # set during draw
+
+        self._cleanup_done = False
 
         # --- SETUP MODULES ---
         self._start_pi_services()
+        atexit.register(self._stop_pi_services)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
         self._init_network()
         self._init_pygame()
         self._start_video_thread()
+
+    def _signal_handler(self, signum, frame):
+        """Handle Ctrl+C and SIGTERM gracefully"""
+        self.running = False
 
     def _start_pi_services(self):
         """Start receiver and video stream on Pi via SSH"""
@@ -86,18 +96,21 @@ class RobotCockpit:
         time.sleep(1)
         
         # Start cockpit receiver (needs sudo for GPIO)
+        # -tt forces TTY so remote process dies when SSH is killed
         print("[LAUNCHER] Starting cockpit_receiver.py on Pi...")
         p1 = subprocess.Popen(
-            ["ssh", self.SSH_HOST, f"sudo python3 {self.PI_RECEIVER}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            ["ssh", "-tt", self.SSH_HOST, f"sudo python3 {self.PI_RECEIVER}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL
         )
         self.ssh_processes.append(p1)
         
         # Start video stream
         print("[LAUNCHER] Starting video_stream.py on Pi...")
         p2 = subprocess.Popen(
-            ["ssh", self.SSH_HOST, f"python3 {self.PI_VIDEO}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            ["ssh", "-tt", self.SSH_HOST, f"python3 {self.PI_VIDEO}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL
         )
         self.ssh_processes.append(p2)
         
@@ -116,30 +129,43 @@ class RobotCockpit:
 
     def _stop_pi_services(self):
         """Stop all Pi services"""
+        if self._cleanup_done:
+            return
+        self._cleanup_done = True
         print("[LAUNCHER] Stopping Pi services...")
         
-        # Kill remote processes (sudo needed to kill the sudo receiver)
-        try:
-            subprocess.run(
-                ["ssh", self.SSH_HOST,
-                 "sudo pkill -f cockpit_receiver.py; sudo pkill -f video_stream.py"],
-                capture_output=True, timeout=10
-            )
-        except Exception as e:
-            print(f"[LAUNCHER] Warning: remote kill failed: {e}")
-        
-        # Kill local SSH tunnels
+        # First kill local SSH tunnels — with -tt, this sends SIGHUP to remote
         for p in self.ssh_processes:
             try:
                 p.terminate()
-                p.wait(timeout=3)
+                p.wait(timeout=2)
             except Exception:
                 try:
                     p.kill()
+                    p.wait(timeout=1)
                 except Exception:
                     pass
-        
         self.ssh_processes.clear()
+        
+        # Then explicitly kill any remaining remote processes
+        kill_cmd = (
+            "sudo pkill -9 -f cockpit_receiver.py; "
+            "sudo pkill -9 -f video_stream.py; "
+            "sudo pkill -9 -f 'python3.*video_stream'; "
+            "sudo pkill -9 -f 'python3.*cockpit_receiver'; "
+            "sudo fuser -k /dev/video0 2>/dev/null"
+        )
+        for _ in range(2):
+            try:
+                subprocess.run(
+                    ["ssh", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no",
+                     self.SSH_HOST, kill_cmd],
+                    capture_output=True, timeout=5
+                )
+            except Exception:
+                pass
+            time.sleep(0.3)
+        
         print("[LAUNCHER] Pi services stopped.")
 
     def _init_network(self):
@@ -189,6 +215,7 @@ class RobotCockpit:
         self.font_md = pygame.font.SysFont("monospace", max(13, int(18 * scale)))
         self.font_lg = pygame.font.SysFont("monospace", max(18, int(26 * scale)))
         self.font_xl = pygame.font.SysFont("monospace", max(22, int(32 * scale)))
+        self.font_rpm = pygame.font.SysFont("monospace", max(14, int(16 * scale)), bold=True)
 
     def _start_video_thread(self):
         """Starts the background video fetcher"""
@@ -421,35 +448,51 @@ class RobotCockpit:
     def _draw_speedometer(self, x, y, radius):
         """Draws the Analog Gauge with real encoder speed"""
         # Use average of both wheel speeds (real encoder data)
-        speed = (self.speed_L + self.speed_R) / 2.0
+        enc_speed = (self.speed_L + self.speed_R) / 2.0
+        # Fallback to throttle estimate if encoders read zero and throttle is active
+        if abs(enc_speed) < 0.1 and abs(self.throttle_actual) > 0.01:
+            speed = self.throttle_actual * self.MAX_EST_SPEED_CMS
+        else:
+            speed = enc_speed
+        
+        is_reverse = speed < 0
+        abs_speed = abs(speed)
         
         # Arc
         rect = pygame.Rect(x - radius, y - radius, radius * 2, radius * 2)
-        pygame.draw.arc(self.screen, (100, 100, 100), rect, 0, 3.14, 10)
+        arc_color = (100, 100, 100) if not is_reverse else (100, 50, 50)
+        pygame.draw.arc(self.screen, arc_color, rect, 0, 3.14, 10)
         
         # Speed limit arc (yellow zone)
         limit_angle = 3.14 * (1 - self.speed_limit)
         pygame.draw.arc(self.screen, (80, 80, 0), rect, 0, limit_angle, 6)
         
-        # Needle
-        pct = speed / self.MAX_EST_SPEED_CMS
+        # Needle (uses absolute speed for position)
+        pct = min(abs_speed / self.MAX_EST_SPEED_CMS, 1.0)
         angle = 180 - (pct * 180)
         rad = math.radians(angle)
         
         end_x = x + (radius - 10) * math.cos(rad)
         end_y = y - (radius - 10) * math.sin(rad)
         
-        color = (0, 255, 255) if speed >= 0 else (255, 100, 100)
+        color = (0, 255, 255) if not is_reverse else (255, 100, 100)
         pygame.draw.line(self.screen, color, (x, y), (end_x, end_y), 4)
         pygame.draw.circle(self.screen, color, (x, y), 5)
         
-        # Text
+        # Scale labels
         self.screen.blit(self.font_sm.render("0", 1, (150, 150, 150)), (x - radius, y + 10))
         self.screen.blit(self.font_sm.render("100", 1, (150, 150, 150)), (x + radius - 30, y + 10))
         
-        spd_text = self.font_lg.render(f"{abs(int(speed))}", 1, (255, 255, 255))
+        # Speed value (always positive, like a real car speedometer)
+        spd_text = self.font_lg.render(f"{int(abs_speed)}", 1, (255, 255, 255))
         self.screen.blit(spd_text, (x - spd_text.get_width()//2, y - 40))
         self.screen.blit(self.font_sm.render("cm/s", 1, (150,150,150)), (x - 15, y - 10))
+        
+        # Drive/Reverse gear indicator (Tesla-style D/R)
+        gear = "R" if is_reverse else "D"
+        gear_color = (255, 80, 80) if is_reverse else (0, 220, 0)
+        gear_text = self.font_rpm.render(gear, 1, gear_color)
+        self.screen.blit(gear_text, (x + radius - 20, y - 15))
         
         # Speed limit indicator
         limit_pct = int(self.speed_limit * 100)
@@ -457,13 +500,14 @@ class RobotCockpit:
         lim_text = self.font_sm.render(f"LIMIT: {limit_pct}%  [+/-]", 1, limit_color)
         self.screen.blit(lim_text, (x - lim_text.get_width()//2, y + 20))
 
-        # RPM display
-        avg_rpm = (abs(self.rpm_L) + abs(self.rpm_R)) / 2.0
-        rpm_text = self.font_sm.render(f"RPM L:{int(self.rpm_L)} R:{int(self.rpm_R)}", 1, (180, 180, 180))
+        # RPM display — always positive (magnitude only), bold
+        rpm_l = abs(int(self.rpm_L))
+        rpm_r = abs(int(self.rpm_R))
+        rpm_text = self.font_rpm.render(f"RPM  L:{rpm_l}  R:{rpm_r}", 1, (0, 230, 230))
         self.screen.blit(rpm_text, (x - rpm_text.get_width()//2, y + 35))
 
     def _draw_interface(self):
-        """Main Drawing Loop - Fully Dynamic Layout"""
+        """Main Drawing Loop - Fully Dynamic Proportional Layout"""
         W, H = self.SCREEN_W, self.SCREEN_H
         self.screen.fill((30, 30, 30))
 
@@ -477,162 +521,94 @@ class RobotCockpit:
             txt = self.font_lg.render("WAITING FOR VIDEO...", 1, (255, 255, 255))
             self.screen.blit(txt, (10 + vw // 2 - txt.get_width() // 2, H // 2))
 
-        # 2. DASHBOARD (right panel - all positions relative to panel)
+        # 2. DASHBOARD (right panel - proportional layout)
         panel_x = W - self.PANEL_W
         pw = self.PANEL_W - 20
-        panel_h = H - 20  # usable panel height
         half_pw = pw // 2 - 5
-        margin = 10
-        
-        # --- Distribute widgets vertically ---
-        # Sonar boxes: 16% of panel height
-        sonar_h = max(60, int(panel_h * 0.14))
-        sonar_y = 10
-        
+        gap = max(4, int(H * 0.006))  # proportional gap
+        slider_h = max(32, int(H * 0.055))  # slider height scales with window
+        bar_h_track = max(8, int(H * 0.015))  # thin track bar
+
+        # Current Y cursor - flows top to bottom
+        cy = 10
+
+        # --- Sonar Boxes ---
+        sonar_h = max(45, int(H * 0.09))
         col_L = (0, 255, 0) if self.dist_L >= 60 else (255, 255, 0) if self.dist_L >= 30 else (255, 0, 0)
-        pygame.draw.rect(self.screen, (50, 50, 50), (panel_x, sonar_y, half_pw, sonar_h))
-        self.screen.blit(self.font_md.render("L-DIST", 1, (200, 200, 200)), (panel_x + 10, sonar_y + 8))
-        self.screen.blit(self.font_xl.render(f"{self.dist_L}", 1, col_L), (panel_x + 10, sonar_y + sonar_h // 2))
+        pygame.draw.rect(self.screen, (50, 50, 50), (panel_x, cy, half_pw, sonar_h))
+        self.screen.blit(self.font_sm.render("L-DIST", 1, (200, 200, 200)), (panel_x + 5, cy + 3))
+        self.screen.blit(self.font_lg.render(f"{self.dist_L}", 1, col_L), (panel_x + 5, cy + sonar_h // 2))
 
         col_R = (0, 255, 0) if self.dist_R >= 60 else (255, 255, 0) if self.dist_R >= 30 else (255, 0, 0)
-        pygame.draw.rect(self.screen, (50, 50, 50), (panel_x + half_pw + 10, sonar_y, half_pw, sonar_h))
-        self.screen.blit(self.font_md.render("R-DIST", 1, (200, 200, 200)), (panel_x + half_pw + 20, sonar_y + 8))
-        self.screen.blit(self.font_xl.render(f"{self.dist_R}", 1, col_R), (panel_x + half_pw + 20, sonar_y + sonar_h // 2))
+        pygame.draw.rect(self.screen, (50, 50, 50), (panel_x + half_pw + 10, cy, half_pw, sonar_h))
+        self.screen.blit(self.font_sm.render("R-DIST", 1, (200, 200, 200)), (panel_x + half_pw + 15, cy + 3))
+        self.screen.blit(self.font_lg.render(f"{self.dist_R}", 1, col_R), (panel_x + half_pw + 15, cy + sonar_h // 2))
+        cy += sonar_h + gap
 
-        # Speedometer: centered in middle ~50% of panel
-        gauge_radius = max(40, min(90, int(panel_h * 0.18)))
+        # --- Speedometer ---
+        gauge_radius = max(35, min(80, int(H * 0.12)))
         gauge_cx = panel_x + pw // 2
-        gauge_y = sonar_y + sonar_h + margin + gauge_radius + 20
+        gauge_y = cy + gauge_radius + 10
         self._draw_speedometer(gauge_cx, gauge_y, gauge_radius)
+        cy = gauge_y + gauge_radius + max(20, int(H * 0.03))
 
-        # Steering bar: below speedometer
-        steer_y = gauge_y + gauge_radius + 30
-        steer_h = max(45, int(panel_h * 0.10))
-        pygame.draw.rect(self.screen, (50, 50, 50), (panel_x, steer_y, pw, steer_h))
-        self.screen.blit(self.font_md.render("STEERING", 1, (200, 200, 200)),
-                         (gauge_cx - 45, steer_y + 5))
-        
-        bar_cx = gauge_cx
-        bar_y = steer_y + steer_h - 20
+        # --- Steering Bar ---
+        steer_box_h = max(30, int(H * 0.06))
+        pygame.draw.rect(self.screen, (50, 50, 50), (panel_x, cy, pw, steer_box_h))
+        self.screen.blit(self.font_sm.render("STEERING", 1, (200, 200, 200)), (gauge_cx - 35, cy + 2))
+        bar_y = cy + steer_box_h - bar_h_track - 5
         bar_w = pw - 20
-        pygame.draw.rect(self.screen, (100, 100, 100), (panel_x + 10, bar_y, bar_w, 12))
-        
+        bar_cx = gauge_cx
+        pygame.draw.rect(self.screen, (100, 100, 100), (panel_x + 10, bar_y, bar_w, bar_h_track))
         bar_half = bar_w // 2
         if self.current_steer < 0:
             bw = abs(self.current_steer) * bar_half
-            pygame.draw.rect(self.screen, (255, 0, 0), (bar_cx - bw, bar_y, bw, 12))
+            pygame.draw.rect(self.screen, (255, 0, 0), (bar_cx - bw, bar_y, bw, bar_h_track))
         elif self.current_steer > 0:
             bw = abs(self.current_steer) * bar_half
-            pygame.draw.rect(self.screen, (0, 255, 0), (bar_cx, bar_y, bw, 12))
-            
-        pygame.draw.line(self.screen, (255, 255, 255), (bar_cx, bar_y - 2), (bar_cx, bar_y + 14), 2)
+            pygame.draw.rect(self.screen, (0, 255, 0), (bar_cx, bar_y, bw, bar_h_track))
+        pygame.draw.line(self.screen, (255, 255, 255), (bar_cx, bar_y - 2), (bar_cx, bar_y + bar_h_track + 2), 2)
+        cy += steer_box_h + gap
 
-        # Speed Limit Slider (clickable/draggable)
-        slider_y = bar_y + 30
-        slider_w = pw - 20
-        slider_h = 40
+        # --- Sliders (MAX SPEED, MAX STEER, STOP DIST) ---
         slider_x = panel_x + 10
-        self.slider_rect = pygame.Rect(slider_x, slider_y, slider_w, slider_h)
-        
-        # Background box
-        pygame.draw.rect(self.screen, (50, 50, 50), self.slider_rect)
-        self.screen.blit(self.font_sm.render("MAX SPEED", 1, (200, 200, 200)), (slider_x + 2, slider_y + 2))
-        
-        # Filled bar showing current limit
-        fill_w = int(self.speed_limit * slider_w)
+        slider_w = pw - 20
+        track_h = max(12, int(slider_h * 0.45))
+
+        # Helper to draw a slider
+        def draw_slider(sy, label, value_text, fill_pct, fill_color):
+            rect = pygame.Rect(slider_x, sy, slider_w, slider_h)
+            pygame.draw.rect(self.screen, (50, 50, 50), rect)
+            self.screen.blit(self.font_sm.render(label, 1, (200, 200, 200)), (slider_x + 2, sy + 1))
+            track_y = sy + slider_h - track_h - 2
+            fill_w = int(fill_pct * slider_w)
+            pygame.draw.rect(self.screen, fill_color, (slider_x, track_y, fill_w, track_h))
+            pygame.draw.rect(self.screen, (100, 100, 100), (slider_x, track_y, slider_w, track_h), 1)
+            pygame.draw.rect(self.screen, (255, 255, 255), (slider_x + fill_w - 3, track_y - 2, 6, track_h + 4))
+            vt = self.font_sm.render(value_text, 1, (255, 255, 255))
+            self.screen.blit(vt, (slider_x + slider_w - vt.get_width() - 2, sy + 1))
+            return rect
+
+        # MAX SPEED slider
         limit_pct = int(self.speed_limit * 100)
-        if limit_pct <= 30:
-            fill_color = (0, 200, 0)
-        elif limit_pct <= 60:
-            fill_color = (255, 255, 0)
-        else:
-            fill_color = (255, 80, 80)
-        pygame.draw.rect(self.screen, fill_color, (slider_x, slider_y + 18, fill_w, 18))
-        
-        # Track outline
-        pygame.draw.rect(self.screen, (100, 100, 100), (slider_x, slider_y + 18, slider_w, 18), 1)
-        
-        # Thumb handle
-        thumb_x = slider_x + fill_w
-        pygame.draw.rect(self.screen, (255, 255, 255), (thumb_x - 3, slider_y + 16, 6, 22))
-        
-        # Percentage text
-        pct_text = self.font_md.render(f"{limit_pct}%", 1, (255, 255, 255))
-        self.screen.blit(pct_text, (slider_x + slider_w - pct_text.get_width() - 2, slider_y + 1))
+        sp_color = (0, 200, 0) if limit_pct <= 30 else (255, 255, 0) if limit_pct <= 60 else (255, 80, 80)
+        self.slider_rect = draw_slider(cy, "MAX SPEED", f"{limit_pct}%", self.speed_limit, sp_color)
+        cy += slider_h + gap
 
-        # Steering Angle Limit Slider
-        steer_sl_y = slider_y + slider_h + 10
-        steer_sl_w = slider_w
-        steer_sl_h = 40
-        steer_sl_x = slider_x
-        self.steer_slider_rect = pygame.Rect(steer_sl_x, steer_sl_y, steer_sl_w, steer_sl_h)
+        # MAX STEER slider
+        st_color = (0, 200, 0) if self.steer_limit_deg <= 25 else (0, 180, 255) if self.steer_limit_deg <= 50 else (255, 165, 0)
+        self.steer_slider_rect = draw_slider(cy, "MAX STEER", f"{self.steer_limit_deg}\u00b0", self.steer_limit_deg / 80.0, st_color)
+        cy += slider_h + gap
 
-        # Background box
-        pygame.draw.rect(self.screen, (50, 50, 50), self.steer_slider_rect)
-        self.screen.blit(self.font_sm.render("MAX STEER", 1, (200, 200, 200)), (steer_sl_x + 2, steer_sl_y + 2))
-
-        # Filled bar
-        steer_pct = self.steer_limit_deg / 80.0
-        steer_fill_w = int(steer_pct * steer_sl_w)
-        if self.steer_limit_deg <= 25:
-            steer_color = (0, 200, 0)
-        elif self.steer_limit_deg <= 50:
-            steer_color = (0, 180, 255)
-        else:
-            steer_color = (255, 165, 0)
-        pygame.draw.rect(self.screen, steer_color, (steer_sl_x, steer_sl_y + 18, steer_fill_w, 18))
-
-        # Track outline
-        pygame.draw.rect(self.screen, (100, 100, 100), (steer_sl_x, steer_sl_y + 18, steer_sl_w, 18), 1)
-
-        # Thumb handle
-        st_thumb_x = steer_sl_x + steer_fill_w
-        pygame.draw.rect(self.screen, (255, 255, 255), (st_thumb_x - 3, steer_sl_y + 16, 6, 22))
-
-        # Degree text
-        deg_text = self.font_md.render(f"{self.steer_limit_deg}\u00b0", 1, (255, 255, 255))
-        self.screen.blit(deg_text, (steer_sl_x + steer_sl_w - deg_text.get_width() - 2, steer_sl_y + 1))
-
-        # Obstacle Distance Threshold Slider
-        dist_sl_y = steer_sl_y + steer_sl_h + 10
-        dist_sl_w = steer_sl_w
-        dist_sl_h = 40
-        dist_sl_x = slider_x
-        self.dist_slider_rect = pygame.Rect(dist_sl_x, dist_sl_y, dist_sl_w, dist_sl_h)
-
-        # Background box
-        pygame.draw.rect(self.screen, (50, 50, 50), self.dist_slider_rect)
-        self.screen.blit(self.font_sm.render("STOP DIST", 1, (200, 200, 200)), (dist_sl_x + 2, dist_sl_y + 2))
-
-        # Filled bar (5-200 cm range)
+        # STOP DIST slider
         dist_pct = (self.obstacle_dist_cm - 5) / 195.0
-        dist_fill_w = int(dist_pct * dist_sl_w)
-        if self.obstacle_dist_cm <= 30:
-            dist_color = (0, 200, 0)
-        elif self.obstacle_dist_cm <= 80:
-            dist_color = (255, 200, 0)
-        else:
-            dist_color = (255, 80, 80)
-        pygame.draw.rect(self.screen, dist_color, (dist_sl_x, dist_sl_y + 18, dist_fill_w, 18))
+        dt_color = (0, 200, 0) if self.obstacle_dist_cm <= 30 else (255, 200, 0) if self.obstacle_dist_cm <= 80 else (255, 80, 80)
+        self.dist_slider_rect = draw_slider(cy, "STOP DIST", f"{self.obstacle_dist_cm}cm", dist_pct, dt_color)
+        cy += slider_h + gap
 
-        # Track outline
-        pygame.draw.rect(self.screen, (100, 100, 100), (dist_sl_x, dist_sl_y + 18, dist_sl_w, 18), 1)
-
-        # Thumb handle
-        d_thumb_x = dist_sl_x + dist_fill_w
-        pygame.draw.rect(self.screen, (255, 255, 255), (d_thumb_x - 3, dist_sl_y + 16, 6, 22))
-
-        # Distance text
-        dist_txt = self.font_md.render(f"{self.obstacle_dist_cm}cm", 1, (255, 255, 255))
-        self.screen.blit(dist_txt, (dist_sl_x + dist_sl_w - dist_txt.get_width() - 2, dist_sl_y + 1))
-
-        # Obstacle Avoidance ON/OFF Toggle Button
-        oa_btn_y = dist_sl_y + dist_sl_h + 8
-        oa_btn_w = dist_sl_w
-        oa_btn_h = 28
-        oa_btn_x = dist_sl_x
-        self.oa_button_rect = pygame.Rect(oa_btn_x, oa_btn_y, oa_btn_w, oa_btn_h)
-
+        # --- Obstacle Avoidance Toggle Button ---
+        oa_btn_h = max(22, int(H * 0.035))
+        self.oa_button_rect = pygame.Rect(slider_x, cy, slider_w, oa_btn_h)
         if self.obstacle_avoidance_on:
             btn_color = (0, 150, 0)
             btn_label = "OBSTACLE AVOID: ON"
@@ -642,13 +618,14 @@ class RobotCockpit:
         pygame.draw.rect(self.screen, btn_color, self.oa_button_rect)
         pygame.draw.rect(self.screen, (200, 200, 200), self.oa_button_rect, 1)
         btn_text = self.font_sm.render(btn_label, 1, (255, 255, 255))
-        self.screen.blit(btn_text, (oa_btn_x + oa_btn_w // 2 - btn_text.get_width() // 2,
-                                    oa_btn_y + oa_btn_h // 2 - btn_text.get_height() // 2))
+        self.screen.blit(btn_text, (slider_x + slider_w // 2 - btn_text.get_width() // 2,
+                                    cy + oa_btn_h // 2 - btn_text.get_height() // 2))
+        cy += oa_btn_h + gap
 
         # Obstacle blocked warning overlay on video
         if self.obstacle_blocked:
             warn_surf = self.font_lg.render("OBSTACLE - STOPPED", 1, (255, 0, 0))
-            blink = int(time.time() * 4) % 2  # blink at 2Hz
+            blink = int(time.time() * 4) % 2
             if blink:
                 wx = 10 + vw // 2 - warn_surf.get_width() // 2
                 wy = 10 + vh - 50
@@ -657,7 +634,7 @@ class RobotCockpit:
 
         # Hints at bottom
         hint = "F11:fullscreen | +/-:speed | ESC:quit"
-        self.screen.blit(self.font_sm.render(hint, 1, (100, 100, 100)), (panel_x + 5, H - 25))
+        self.screen.blit(self.font_sm.render(hint, 1, (100, 100, 100)), (panel_x + 5, H - 20))
 
         pygame.display.flip()
 
