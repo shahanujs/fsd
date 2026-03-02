@@ -64,6 +64,8 @@ class RobotCockpit:
         self.dist_slider_rect = None
         self.obstacle_dist_cm = 30  # stop if obstacle within this distance (cm)
         self.obstacle_blocked = False  # True when auto-stop is active
+        self.obstacle_avoidance_on = True  # Toggle for obstacle avoidance
+        self.oa_button_rect = None  # set during draw
 
         # --- SETUP MODULES ---
         self._start_pi_services()
@@ -238,7 +240,9 @@ class RobotCockpit:
                     )
                     self._update_layout()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if self.slider_rect and self.slider_rect.collidepoint(event.pos):
+                if self.oa_button_rect and self.oa_button_rect.collidepoint(event.pos):
+                    self.obstacle_avoidance_on = not self.obstacle_avoidance_on
+                elif self.slider_rect and self.slider_rect.collidepoint(event.pos):
                     self.dragging_slider = True
                     self._update_slider_from_mouse(event.pos[0])
                 elif self.steer_slider_rect and self.steer_slider_rect.collidepoint(event.pos):
@@ -342,11 +346,14 @@ class RobotCockpit:
         self.throttle_actual = max(-self.speed_limit, min(self.speed_limit, self.throttle_actual))
 
         # Obstacle avoidance: block forward throttle if obstacle detected
-        min_dist = min(self.dist_L, self.dist_R)
-        if min_dist < self.obstacle_dist_cm and self.throttle_actual > 0:
-            self.throttle_actual = 0.0
-            self.throttle_cmd = 0.0
-            self.obstacle_blocked = True
+        if self.obstacle_avoidance_on:
+            min_dist = min(self.dist_L, self.dist_R)
+            if min_dist < self.obstacle_dist_cm and self.throttle_actual > 0:
+                self.throttle_actual = 0.0
+                self.throttle_cmd = 0.0
+                self.obstacle_blocked = True
+            else:
+                self.obstacle_blocked = False
         else:
             self.obstacle_blocked = False
 
@@ -618,6 +625,25 @@ class RobotCockpit:
         # Distance text
         dist_txt = self.font_md.render(f"{self.obstacle_dist_cm}cm", 1, (255, 255, 255))
         self.screen.blit(dist_txt, (dist_sl_x + dist_sl_w - dist_txt.get_width() - 2, dist_sl_y + 1))
+
+        # Obstacle Avoidance ON/OFF Toggle Button
+        oa_btn_y = dist_sl_y + dist_sl_h + 8
+        oa_btn_w = dist_sl_w
+        oa_btn_h = 28
+        oa_btn_x = dist_sl_x
+        self.oa_button_rect = pygame.Rect(oa_btn_x, oa_btn_y, oa_btn_w, oa_btn_h)
+
+        if self.obstacle_avoidance_on:
+            btn_color = (0, 150, 0)
+            btn_label = "OBSTACLE AVOID: ON"
+        else:
+            btn_color = (150, 0, 0)
+            btn_label = "OBSTACLE AVOID: OFF"
+        pygame.draw.rect(self.screen, btn_color, self.oa_button_rect)
+        pygame.draw.rect(self.screen, (200, 200, 200), self.oa_button_rect, 1)
+        btn_text = self.font_sm.render(btn_label, 1, (255, 255, 255))
+        self.screen.blit(btn_text, (oa_btn_x + oa_btn_w // 2 - btn_text.get_width() // 2,
+                                    oa_btn_y + oa_btn_h // 2 - btn_text.get_height() // 2))
 
         # Obstacle blocked warning overlay on video
         if self.obstacle_blocked:
