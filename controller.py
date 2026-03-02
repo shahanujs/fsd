@@ -44,6 +44,10 @@ class RobotCockpit:
         self.current_steer = 0.0
         self.dist_L = 999
         self.dist_R = 999
+        self.rpm_L = 0.0
+        self.rpm_R = 0.0
+        self.speed_L = 0.0   # cm/s from encoder
+        self.speed_R = 0.0   # cm/s from encoder
         self.throttle_cmd = 0.0      # Raw target (-1 to 1)
         self.throttle_actual = 0.0   # Smoothed actual throttle sent to car
         self.running = True
@@ -398,14 +402,19 @@ class RobotCockpit:
             info = json.loads(data.decode('utf-8'))
             self.dist_L = info.get("dL", 999)
             self.dist_R = info.get("dR", 999)
+            self.rpm_L = info.get("rpmL", 0.0)
+            self.rpm_R = info.get("rpmR", 0.0)
+            self.speed_L = info.get("spdL", 0.0)
+            self.speed_R = info.get("spdR", 0.0)
         except BlockingIOError:
             pass
         except Exception:
             pass
 
     def _draw_speedometer(self, x, y, radius):
-        """Draws the Analog Gauge with smooth speed"""
-        speed = self.throttle_actual * self.MAX_EST_SPEED_CMS
+        """Draws the Analog Gauge with real encoder speed"""
+        # Use average of both wheel speeds (real encoder data)
+        speed = (self.speed_L + self.speed_R) / 2.0
         
         # Arc
         rect = pygame.Rect(x - radius, y - radius, radius * 2, radius * 2)
@@ -440,6 +449,11 @@ class RobotCockpit:
         limit_color = (255, 255, 0) if limit_pct < 60 else (0, 255, 0)
         lim_text = self.font_sm.render(f"LIMIT: {limit_pct}%  [+/-]", 1, limit_color)
         self.screen.blit(lim_text, (x - lim_text.get_width()//2, y + 20))
+
+        # RPM display
+        avg_rpm = (abs(self.rpm_L) + abs(self.rpm_R)) / 2.0
+        rpm_text = self.font_sm.render(f"RPM L:{int(self.rpm_L)} R:{int(self.rpm_R)}", 1, (180, 180, 180))
+        self.screen.blit(rpm_text, (x - rpm_text.get_width()//2, y + 35))
 
     def _draw_interface(self):
         """Main Drawing Loop - Fully Dynamic Layout"""
